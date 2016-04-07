@@ -27,6 +27,7 @@ import (
 	"net"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/uniqush/uniqush-push/push"
@@ -38,6 +39,8 @@ const (
 
 type gcmPushService struct {
 }
+
+var _ push.PushServiceType = &gcmPushService{}
 
 func newGCMPushService() *gcmPushService {
 	ret := new(gcmPushService)
@@ -103,11 +106,11 @@ func (p *gcmPushService) Name() string {
 }
 
 type gcmData struct {
-	RegIDs         []string          `json:"registration_ids"`
-	CollapseKey    string            `json:"collapse_key,omitempty"`
-	Data           map[string]string `json:"data"`
-	DelayWhileIdle bool              `json:"delay_while_idle,omitempty"`
-	TimeToLive     uint              `json:"time_to_live,omitempty"`
+	RegIDs         []string               `json:"registration_ids"`
+	CollapseKey    string                 `json:"collapse_key,omitempty"`
+	Data           map[string]interface{} `json:"data"` // For compatibility with other GCM platforms(e.g. iOS), should always be a map[string]string
+	DelayWhileIdle bool                   `json:"delay_while_idle,omitempty"`
+	TimeToLive     uint                   `json:"time_to_live",omitempty`
 }
 
 func (d *gcmData) String() string {
@@ -131,7 +134,7 @@ func validateRawGCMData(payload string) (map[string]interface{}, push.PushError)
 	var data map[string]interface{}
 	err := json.Unmarshal([]byte(payload), &data)
 	if data == nil {
-		return nil, push.NewBadNotificationWithDetails(fmt.Sprintf("Could not parse GCM JSON payload: %v", err))
+		return nil, push.NewBadNotificationWithDetails(fmt.Sprintf("Could not parse GCM data: %v", err))
 	}
 	return data, nil
 }
@@ -139,8 +142,12 @@ func validateRawGCMData(payload string) (map[string]interface{}, push.PushError)
 // toGCMPayload converts the notification data to a JSON-encoded string to POST to GCM.
 func toGCMPayload(notif *push.Notification, regIds []string) ([]byte, push.PushError) {
 	postData := notif.Data
-	payload := NewGCMPayload(notif.PushType)
+	payload := new(gcmData)
 	payload.RegIDs = regIds
+
+	// TTL: default is one hour
+	payload.TimeToLive = 60 * 60
+	payload.DelayWhileIdle = false
 
 	if mgroup, ok := postData["msggroup"]; ok {
 		payload.CollapseKey = mgroup
@@ -148,30 +155,45 @@ func toGCMPayload(notif *push.Notification, regIds []string) ([]byte, push.PushE
 		payload.CollapseKey = ""
 	}
 
+	if ttlStr, ok := postData["ttl"]; ok {
+		ttl, err := strconv.ParseUint(ttlStr, 10, 32)
+		if err == nil {
+			payload.TimeToLive = uint(ttl)
+		}
+	}
+
 	if rawData, ok := postData["uniqush.payload.gcm"]; ok {
-		// TODO: Add uniqush.notification.gcm as another optional payload, to conform to GCM spec: https://developers.google.com/cloud-messaging/http-server-ref#send-downstream
+		// Could add uniqush.notification.gcm as another optional payload, to conform to GCM spec: https://developers.google.com/cloud-messaging/http-server-ref#send-downstream
 		data, err := validateRawGCMData(rawData)
 		if err != nil {
 			return nil, err
 		}
-		payload.SetData(data)
+		payload.Data = data
 	} else {
+		nr_elem := len(postData)
+		payload.Data = make(map[string]interface{}, nr_elem)
+
 		for k, v := range postData {
 			if strings.HasPrefix(k, "uniqush.") { // The "uniqush." keys are reserved for uniqush use.
 				continue
 			}
-			payload.SetVal(k, v)
+			switch k {
+			case "msggroup", "ttl":
+				continue
+			default:
+				payload.Data[k] = v
+			}
 		}
 	}
-	jpayload, e0 := payload.Json()
 
+	jpayload, e0 := json.Marshal(payload)
 	if e0 != nil {
 		return nil, push.NewErrorf("Error converting payload to JSON: %v", e0)
 	}
 	return jpayload, nil
+
 }
 
-// multicast sends pushes to each push.DeliveryPoint in dpList, sending a response on resQueue for each push.DeliveryPoint.
 func (self *gcmPushService) multicast(psp *push.PushServiceProvider, dpList []*push.DeliveryPoint, resQueue chan<- *push.PushResult, notif *push.Notification) {
 	if len(dpList) == 0 {
 		return
@@ -182,6 +204,7 @@ func (self *gcmPushService) multicast(psp *push.PushServiceProvider, dpList []*p
 	for _, dp := range dpList {
 		regIds = append(regIds, dp.VolatileData["regid"])
 	}
+
 	jpayload, e0 := toGCMPayload(notif, regIds)
 
 	if e0 != nil {
