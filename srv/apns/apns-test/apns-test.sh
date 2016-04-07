@@ -19,4 +19,11 @@ curl http://127.0.0.1:9898/subscriptions -d subscriber=uniqush.client
 curl http://127.0.0.1:9898/psps
 
 curl http://127.0.0.1:9898/push -d service=myservice -d subscriber=uniqush.client -d msg="Hello World"
+
+echo "Removing PSP: expecting empty set of results"
+curl http://127.0.0.1:9898/rmpsp -d service=myservice -d pushservicetype=apns -d cert=$PWD/localhost.cert -d key=$PWD/localhost.key
+echo
+curl http://127.0.0.1:9898/psps
+curl http://127.0.0.1:9898/subscriptions -d subscriber=uniqush.client
+
 echo

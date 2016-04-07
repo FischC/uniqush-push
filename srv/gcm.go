@@ -126,6 +126,52 @@ type gcmResult struct {
 	Results      []map[string]string `json:"results"`
 }
 
+// validateRawGCMData verifies that the user-provided JSON payload is a valid JSON object.
+func validateRawGCMData(payload string) (map[string]interface{}, push.PushError) {
+	var data map[string]interface{}
+	err := json.Unmarshal([]byte(payload), &data)
+	if data == nil {
+		return nil, push.NewBadNotificationWithDetails(fmt.Sprintf("Could not parse GCM JSON payload: %v", err))
+	}
+	return data, nil
+}
+
+// toGCMPayload converts the notification data to a JSON-encoded string to POST to GCM.
+func toGCMPayload(notif *push.Notification, regIds []string) ([]byte, push.PushError) {
+	postData := notif.Data
+	payload := NewGCMPayload(notif.PushType)
+	payload.RegIDs = regIds
+
+	if mgroup, ok := postData["msggroup"]; ok {
+		payload.CollapseKey = mgroup
+	} else {
+		payload.CollapseKey = ""
+	}
+
+	if rawData, ok := postData["uniqush.payload.gcm"]; ok {
+		// TODO: Add uniqush.notification.gcm as another optional payload, to conform to GCM spec: https://developers.google.com/cloud-messaging/http-server-ref#send-downstream
+		data, err := validateRawGCMData(rawData)
+		if err != nil {
+			return nil, err
+		}
+		payload.SetData(data)
+	} else {
+		for k, v := range postData {
+			if strings.HasPrefix(k, "uniqush.") { // The "uniqush." keys are reserved for uniqush use.
+				continue
+			}
+			payload.SetVal(k, v)
+		}
+	}
+	jpayload, e0 := payload.Json()
+
+	if e0 != nil {
+		return nil, push.NewErrorf("Error converting payload to JSON: %v", e0)
+	}
+	return jpayload, nil
+}
+
+// multicast sends pushes to each push.DeliveryPoint in dpList, sending a response on resQueue for each push.DeliveryPoint.
 func (self *gcmPushService) multicast(psp *push.PushServiceProvider, dpList []*push.DeliveryPoint, resQueue chan<- *push.PushResult, notif *push.Notification) {
 	if len(dpList) == 0 {
 		return
@@ -136,53 +182,22 @@ func (self *gcmPushService) multicast(psp *push.PushServiceProvider, dpList []*p
 	for _, dp := range dpList {
 		regIds = append(regIds, dp.VolatileData["regid"])
 	}
-	msg := notif.Data
-	data := new(gcmData)
-	data.RegIDs = regIds
+	jpayload, e0 := toGCMPayload(notif, regIds)
 
-	// TTL: default is one hour
-	data.TimeToLive = 60 * 60
-	data.DelayWhileIdle = false
-
-	if mgroup, ok := msg["msggroup"]; ok {
-		data.CollapseKey = mgroup
-	} else {
-		data.CollapseKey = ""
-	}
-
-	nr_elem := len(msg)
-	data.Data = make(map[string]string, nr_elem)
-
-	for k, v := range msg {
-		switch k {
-		case "msggroup":
-			continue
-		case "ttl":
-			ttl, err := strconv.ParseUint(v, 10, 32)
-			if err != nil {
-				continue
-			}
-			data.TimeToLive = uint(ttl)
-		default:
-			data.Data[k] = v
-		}
-	}
-
-	jdata, e0 := json.Marshal(data)
 	if e0 != nil {
 		for _, dp := range dpList {
 			res := new(push.PushResult)
 			res.Provider = psp
 			res.Content = notif
 
-			res.Err = push.NewErrorf("Error converting payload to JSON: %v", e0)
+			res.Err = e0
 			res.Destination = dp
 			resQueue <- res
 		}
 		return
 	}
 
-	req, e1 := http.NewRequest("POST", gcmServiceURL, bytes.NewReader(jdata))
+	req, e1 := http.NewRequest("POST", gcmServiceURL, bytes.NewReader(jpayload))
 	if e1 != nil {
 		for _, dp := range dpList {
 			res := new(push.PushResult)
